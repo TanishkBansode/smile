@@ -22,6 +22,7 @@ import subprocess
 import re
 import subprocess
 import gc
+import json
 from time import time_ns, sleep
 from typing import Optional
 
@@ -64,6 +65,15 @@ class Picker(Gtk.ApplicationWindow):
         self.shortcut_window: Optional[ShortcutsWindow] = None
         self.shift_key_pressed = False
         self.skintone_selector: Optional[SkintoneSelector] = None
+
+        # Semantic Search Integration
+        self.semantic_ready = False
+        self.semantic_model = None
+        self.semantic_index = None
+        self.semantic_map = []
+        self.semantic_distances = {} # query -> {hexcode: distance}
+        self.faiss_thread = threading.Thread(target=self.init_semantic_search, daemon=True)
+        self.faiss_thread.start()
 
         event_controller_keys = Gtk.EventControllerKey()
         event_controller_keys.connect('key-pressed', self.handle_window_key_press)
@@ -198,6 +208,32 @@ class Picker(Gtk.ApplicationWindow):
 
         return Gtk.MenuButton(menu_model=menu, icon_name='open-menu-symbolic')
 
+    def init_semantic_search(self):
+        try:
+            import faiss
+            from sentence_transformers import SentenceTransformer
+            
+            # Load map
+            script_dir = os.path.dirname(os.path.realpath(__file__))
+            map_path = os.path.join(script_dir, 'assets', 'emoji_index_map.json')
+            index_path = os.path.join(script_dir, 'assets', 'emoji_index.faiss')
+            
+            if os.path.exists(map_path) and os.path.exists(index_path):
+                with open(map_path, 'r') as f:
+                    self.semantic_map = json.load(f)
+                
+                self.semantic_index = faiss.read_index(index_path)
+                self.semantic_model = SentenceTransformer('all-mpnet-base-v2', device='cpu')
+                self.semantic_ready = True
+                print("Smile semantic search initialized successfully!")
+                
+                # Force refresh if there's already a query
+                if self.query:
+                    # Use GLib.idle_add to update UI from background thread
+                    GLib.idle_add(self.refresh_emoji_list)
+        except Exception as e:
+            print(f"Failed to initialize semantic search: {e}")
+
     def create_category_picker(self) -> Gtk.Box:
         box = Gtk.Box(spacing=0, halign=Gtk.Align.CENTER, hexpand=True, name='emoji_categories_box')
 
@@ -236,6 +272,22 @@ class Picker(Gtk.ApplicationWindow):
 
         if self.query:
             use_localised_tags = self.settings.get_boolean('use-localized-tags')
+            
+            # Run semantic search if ready
+            self.current_semantic_results = set()
+            if self.semantic_ready:
+                import numpy as np
+                query_emb = self.semantic_model.encode([self.query], normalize_embeddings=True)
+                top_k = min(30, len(self.semantic_map))
+                distances, indices = self.semantic_index.search(query_emb.astype('float32'), top_k)
+                
+                self.semantic_distances = {}
+                for i in range(top_k):
+                    idx = indices[0][i]
+                    if idx != -1 and idx < len(self.semantic_map):
+                        hexcode = self.semantic_map[idx]
+                        self.current_semantic_results.add(hexcode)
+                        self.semantic_distances[hexcode] = float(distances[0][i])
 
         for emoji in emojis.values():
             is_recent = (emoji['hexcode'] in self.history)
@@ -255,6 +307,27 @@ class Picker(Gtk.ApplicationWindow):
                     filter_result = True
                 elif custom_tags and tag_list_contains(custom_tags, self.query):
                     filter_result = True
+                # Add Semantic Search Check
+                elif self.semantic_ready and self.query:
+                    # Since emojis might have skintones, check if their base_hexcode is in results
+                    base_hexcode = emoji.get('skintone_base_hexcode', emoji['hexcode'])
+                    if not base_hexcode:
+                        base_hexcode = emoji['hexcode']
+                    
+                    if base_hexcode in self.current_semantic_results:
+                        filter_result = True
+                        # If filtering matched on semantic search, ensure the specific variant inherits the distance
+                        if emoji['hexcode'] != base_hexcode:
+                             self.semantic_distances[emoji['hexcode']] = self.semantic_distances[base_hexcode]
+                    else:
+                        # Fallback to literal tags if not in top K semantic matches
+                        if use_localised_tags:
+                            if merge_english_tags:
+                                filter_result = tag_list_contains(','.join(localized_tags), self.query) or tag_list_contains(emoji['tags'], self.query)
+                            else:
+                                filter_result = tag_list_contains(','.join(localized_tags), self.query)
+                        else:
+                            filter_result = tag_list_contains(emoji['tags'], self.query)
                 elif use_localised_tags:
                     if merge_english_tags:
                         filter_result = tag_list_contains(','.join(localized_tags), self.query) or tag_list_contains(emoji['tags'], self.query)
@@ -671,11 +744,29 @@ class Picker(Gtk.ApplicationWindow):
             return ((h2['lastUsage'] if h2 else 0) - (h1['lastUsage'] if h1 else 0))
 
         elif self.query:
-            hexcode = child2.emoji_data.get('skintone_base_hexcode', child2.hexcode)
-            if get_custom_tags(hexcode, True):
+            hexcode_1 = child1.emoji_data.get('skintone_base_hexcode', child1.hexcode) or child1.hexcode
+            hexcode_2 = child2.emoji_data.get('skintone_base_hexcode', child2.hexcode) or child2.hexcode
+            
+            has_custom_1 = get_custom_tags(hexcode_1, True)
+            has_custom_2 = get_custom_tags(hexcode_2, True)
+            
+            # Custom tags always take priority
+            if has_custom_1 and not has_custom_2:
+                return -1
+            elif has_custom_2 and not has_custom_1:
                 return 1
-            else:
-                return (child1.emoji_data['order'] - child2.emoji_data['order'])
+            
+            # Semantic search priority (higher distance score = better match)
+            if self.semantic_ready:
+                dist1 = self.semantic_distances.get(child1.hexcode, -1.0)
+                dist2 = self.semantic_distances.get(child2.hexcode, -1.0)
+                
+                # If distances are significantly different, sort by highest distance first
+                if abs(dist1 - dist2) > 0.001:
+                    return -1 if dist1 > dist2 else 1
+            
+            # Fallback to default ordering
+            return (child1.emoji_data['order'] - child2.emoji_data['order'])
 
         else:
             return (child1.emoji_data['order'] - child2.emoji_data['order'])

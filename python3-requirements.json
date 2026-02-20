@@ -16,6 +16,19 @@
                     "sha256": "92bdd1e68b45596c833307a5ff4b217ee6929a1502f5341bae28fd120acf7260"
                 }
             ]
+        },
+        {
+            "name": "python3-semantic-search-deps",
+            "buildsystem": "simple",
+            "build-options": {
+                "build-args": [
+                    "--share=network"
+                ]
+            },
+            "build-commands": [
+                "mkdir -p build_tmp",
+                "TMPDIR=$PWD/build_tmp pip3 install --cache-dir=$PWD/build_tmp --verbose --prefix=${FLATPAK_DEST} faiss-cpu sentence-transformers numpy"
+            ]
         }
     ]
 }

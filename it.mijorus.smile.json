@@ -6,6 +6,7 @@
     "command": "smile",
     "finish-args": [
         "--share=ipc",
+        "--share=network",
         "--socket=wayland",
         "--socket=fallback-x11",
         "--device=dri",
